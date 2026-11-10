@@ -37,7 +37,13 @@ export function startSession(onState) {
     }
     unsubDevice = onSnapshot(
       doc(db, 'devices', user.uid),
+      // includeMetadataChanges : on est prévenu quand l'écriture locale est confirmée par le serveur
+      { includeMetadataChanges: true },
       (snap) => {
+        // Juste après l'inscription, le document n'existe encore que localement :
+        // on attend la confirmation du serveur, sinon les règles refusent les lectures
+        // (« Missing or insufficient permissions »).
+        if (snap.metadata.hasPendingWrites) return;
         if (snap.exists()) {
           const userId = snap.data().userId;
           localStorage.setItem(LS_SESSION_KEY, JSON.stringify({ deviceToken: user.uid, userId }));

@@ -70,9 +70,25 @@ startSession((s) => {
   scheduleRender();
 });
 
+let subscribeRetries = 0;
+let retryTimer = null;
 function subscribe(userId) {
   unsubscribe();
-  const onErr = (err) => { console.error(err); toast(errorMessage(err), 'error'); };
+  const onErr = (err) => {
+    console.error(err);
+    // Un refus juste après l'inscription / l'association peut être transitoire : on réessaie (2 fois max)
+    if (String(err?.code).includes('permission-denied') && subscribeRetries < 2) {
+      if (!retryTimer) {
+        subscribeRetries++;
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          if (state.session.userId === userId) subscribe(userId);
+        }, 1500);
+      }
+      return;
+    }
+    toast(errorMessage(err), 'error');
+  };
   unsubs = [
     data.watchUsers((list) => { state.users = list; state.ready.users = true; changed(); }, onErr),
     data.watchGifts((list, server) => {
