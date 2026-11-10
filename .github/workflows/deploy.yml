@@ -1,0 +1,91 @@
+# =============================================================================
+#  Déploiement automatique sur GitHub Pages (branche gh-pages)
+#
+#  Déclenché à chaque push sur « main » (ou manuellement depuis l'onglet Actions).
+#  Étapes :
+#    1. récupère le code ;
+#    2. lance les tests de la logique de vote (égalités) ;
+#    3. génère firebase-config.js à partir des secrets GitHub (jamais commité) ;
+#    4. publie le site statique sur la branche gh-pages.
+# =============================================================================
+name: Déploiement GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:          # bouton « Run workflow » dans l'onglet Actions
+
+# Autorise le workflow à pousser sur la branche gh-pages
+permissions:
+  contents: write
+
+# Un seul déploiement à la fois ; un nouveau push annule le précédent
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Code source
+      - name: Récupération du dépôt
+        uses: actions/checkout@v4
+
+      # 2. Tests unitaires (aucune dépendance npm : Node suffit)
+      - name: Installation de Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Tests de la logique de vote et des égalités
+        run: node tests/results.test.mjs
+
+      # 3. Configuration Firebase depuis les secrets du dépôt
+      #    (Settings → Secrets and variables → Actions → New repository secret)
+      - name: Génération de firebase-config.js
+        env:
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          FIREBASE_AUTH_DOMAIN: ${{ secrets.FIREBASE_AUTH_DOMAIN }}
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_STORAGE_BUCKET: ${{ secrets.FIREBASE_STORAGE_BUCKET }}
+          FIREBASE_MESSAGING_SENDER_ID: ${{ secrets.FIREBASE_MESSAGING_SENDER_ID }}
+          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+        run: |
+          # Échec immédiat si un secret obligatoire manque
+          for v in FIREBASE_API_KEY FIREBASE_PROJECT_ID FIREBASE_APP_ID; do
+            if [ -z "${!v}" ]; then echo "::error::Secret $v manquant"; exit 1; fi
+          done
+          # Valeurs par défaut déduites du projet si non fournies
+          : "${FIREBASE_AUTH_DOMAIN:=${FIREBASE_PROJECT_ID}.firebaseapp.com}"
+          : "${FIREBASE_STORAGE_BUCKET:=${FIREBASE_PROJECT_ID}.firebasestorage.app}"
+          cat > firebase-config.js <<EOF
+          // Fichier généré automatiquement par GitHub Actions — ne pas modifier.
+          export const firebaseConfig = {
+            apiKey: '${FIREBASE_API_KEY}',
+            authDomain: '${FIREBASE_AUTH_DOMAIN}',
+            projectId: '${FIREBASE_PROJECT_ID}',
+            storageBucket: '${FIREBASE_STORAGE_BUCKET}',
+            messagingSenderId: '${FIREBASE_MESSAGING_SENDER_ID}',
+            appId: '${FIREBASE_APP_ID}',
+          };
+          EOF
+          echo "firebase-config.js généré pour le projet ${FIREBASE_PROJECT_ID}"
+
+      # 4. Préparation du dossier publié (on n'envoie que les fichiers du site)
+      - name: Préparation du site
+        run: |
+          mkdir -p _site
+          cp index.html app.js style.css firebase-config.js icon.svg manifest.webmanifest _site/
+          cp -r js _site/
+          touch _site/.nojekyll   # désactive Jekyll (fichiers servis tels quels)
+
+      # 5. Publication sur la branche gh-pages
+      - name: Publication sur gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./_site
+          publish_branch: gh-pages
+          force_orphan: true      # historique gh-pages réduit à un seul commit
+          commit_message: "Déploiement ${{ github.sha }}"

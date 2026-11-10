@@ -1,0 +1,18 @@
+{
+  "name": "liste-noel-famille",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Liste de Noël familiale : idées de cadeaux, cadeaux communs, votes secrets et révélation le 5 décembre.",
+  "type": "module",
+  "scripts": {
+    "start": "npx --yes serve -l 5500 .",
+    "test": "node tests/results.test.mjs",
+    "test:rules": "firebase emulators:exec --only firestore --project demo-liste-noel \"node --test tests/rules.test.mjs\"",
+    "deploy:rules": "firebase deploy --only firestore:rules"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.0",
+    "firebase": "^12.15.0",
+    "firebase-tools": "^15.0.0"
+  }
+}

@@ -1,0 +1,10 @@
+# Configuration Firebase locale (générée par GitHub Actions en production)
+firebase-config.js
+
+# Outils
+node_modules/
+_site/
+.firebase/
+*-debug.log
+.DS_Store
+Thumbs.db

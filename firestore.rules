@@ -1,0 +1,261 @@
+rules_version = '2';
+
+// =============================================================================
+//  Liste de Noël Familiale — Règles de sécurité Firestore
+//
+//  Principes :
+//   • Chaque appareil est connecté anonymement (request.auth.uid = jeton d'appareil).
+//   • devices/{uid} relie ce jeton à un profil users/{userId} : être « membre »
+//     = avoir un document devices/{mon uid}.
+//   • SECRET DES VOTES : un vote et un résultat (selectedGifts) ne sont lisibles
+//     que par les membres listés dans visibleTo[]. Le destinataire (et le
+//     co-destinataire d'un cadeau commun) est dans hiddenFrom[] et ne peut
+//     JAMAIS y figurer dans visibleTo[] : il ne voit ni votes ni tendances.
+//   • VERROUILLAGE : votes et listes sont figés le 5/12/2026 à 18h00 (Paris).
+// =============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- Outils
+    function signedIn() { return request.auth != null; }
+    function devicePath(uid) { return /databases/$(database)/documents/devices/$(uid); }
+    function isMember() { return signedIn() && exists(devicePath(request.auth.uid)); }
+    function me() { return get(devicePath(request.auth.uid)).data.userId; }
+
+    // 5 décembre 2026, 18h00 heure de Paris (CET = UTC+1) = 17h00 UTC
+    // = 1796490000000 ms. À modifier en même temps que js/config.js.
+    function deadline() { return timestamp.value(1796490000000); }
+    function votingOpen() { return request.time < deadline(); }
+    function votingClosed() { return request.time >= deadline(); }
+
+    function isName(v) { return v is string && v.size() > 0 && v.size() <= 40; }
+    function isText(v, max) { return v is string && v.size() <= max; }
+
+    // Code famille facultatif : si le document config/family existe,
+    // l'inscription exige le bon code (document illisible par les clients).
+    function familyPath() { return /databases/$(database)/documents/config/family; }
+    function familyCodeOk(code) {
+      return !exists(familyPath()) || code == get(familyPath()).data.code;
+    }
+
+    // Deux listes sans élément commun
+    function disjoint(a, b) { return a.toSet().intersection(b.toSet()).size() == 0; }
+
+    // ------------------------------------------------------- Configuration
+    match /config/{docId} {
+      allow read, write: if false;            // uniquement via la console Firebase
+    }
+
+    // -------------------------------------------------------------- Profils
+    match /users/{userId} {
+      allow read: if isMember();
+
+      // Première connexion : créé dans le même lot que devices/{mon uid}
+      allow create: if signedIn()
+        && !exists(devicePath(request.auth.uid))
+        && request.resource.data.keys().hasOnly(['prenom', 'nom', 'deviceTokens', 'familyCode', 'createdAt'])
+        && isName(request.resource.data.prenom)
+        && isName(request.resource.data.nom)
+        && request.resource.data.deviceTokens == [request.auth.uid]
+        && familyCodeOk(request.resource.data.get('familyCode', ''))
+        && getAfter(devicePath(request.auth.uid)).data.userId == userId;
+
+      // Le propriétaire modifie son nom et ses appareils
+      allow update: if isMember() && me() == userId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['prenom', 'nom', 'deviceTokens'])
+        && isName(request.resource.data.prenom)
+        && isName(request.resource.data.nom)
+        && request.resource.data.deviceTokens is list;
+
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------- Appareils (jetons)
+    match /devices/{deviceId} {
+      // Un appareil lit toujours son propre document (même inexistant)
+      allow get: if signedIn()
+        && (request.auth.uid == deviceId || (isMember() && resource.data.userId == me()));
+      // Liste de mes appareils (requête where userId == moi)
+      allow list: if isMember() && resource.data.userId == me();
+
+      // Cas 1 — inscription : créé dans le même lot que le profil
+      allow create: if signedIn()
+        && deviceId == request.auth.uid
+        && request.resource.data.keys().hasOnly(['userId', 'label', 'method', 'createdAt'])
+        && request.resource.data.method == 'register'
+        && isText(request.resource.data.label, 60)
+        && !exists(/databases/$(database)/documents/users/$(request.resource.data.userId))
+        && getAfter(/databases/$(database)/documents/users/$(request.resource.data.userId)).data.deviceTokens == [request.auth.uid];
+
+      // Cas 2 — appairage validé par un appareil déjà connecté au compte
+      allow create: if isMember()
+        && deviceId != request.auth.uid
+        && request.resource.data.keys().hasOnly(['userId', 'label', 'method', 'pairingCode', 'createdAt'])
+        && request.resource.data.method == 'pairing'
+        && request.resource.data.userId == me()
+        && isText(request.resource.data.label, 60)
+        && pairingValidFor(request.resource.data.pairingCode, deviceId);
+
+      // Retirer un appareil de son compte (ou se déconnecter)
+      allow delete: if isMember() && resource.data.userId == me();
+      allow update: if false;
+
+      function pairingValidFor(code, uid) {
+        let p = get(/databases/$(database)/documents/pairings/$(code)).data;
+        return p.requesterUid == uid && p.status == 'pending' && request.time < p.expiresAt;
+      }
+    }
+
+    // ------------------------------------------- Demandes d'appairage (5 min)
+    match /pairings/{code} {
+      allow get: if signedIn();               // lecture par code uniquement
+      allow list: if false;                   // impossible d'énumérer les codes
+
+      allow create: if signedIn() && newPairing(code);
+      allow update: if signedIn() && (
+        // Réutilisation d'un code expiré
+        (request.time >= resource.data.expiresAt && newPairing(code))
+        ||
+        // Validation par un appareil connecté, avant expiration
+        (isMember()
+          && resource.data.status == 'pending'
+          && request.time < resource.data.expiresAt
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'userId', 'approvedAt'])
+          && request.resource.data.status == 'approved'
+          && request.resource.data.userId == me())
+      );
+      allow delete: if signedIn() && resource.data.requesterUid == request.auth.uid;
+
+      function newPairing(code) {
+        let d = request.resource.data;
+        return code.matches('^[0-9]{6}$')
+          && d.keys().hasOnly(['code', 'requesterUid', 'status', 'label', 'createdAt', 'expiresAt'])
+          && d.code == code
+          && d.requesterUid == request.auth.uid
+          && d.status == 'pending'
+          && isText(d.label, 60)
+          && d.expiresAt is timestamp
+          && d.expiresAt > request.time
+          && d.expiresAt <= request.time + duration.value(10, 'm');   // marge d'horloge
+      }
+    }
+
+    // ---------------------------------------------------------------- Cadeaux
+    match /gifts/{giftId} {
+      allow read: if isMember();
+
+      allow create: if isMember() && votingOpen()
+        && validGift(request.resource.data)
+        && request.resource.data.createdBy == me()
+        && request.resource.data.ownerIds == [me()];
+
+      // Les propriétaires (1 ou 2 si cadeau commun) modifient le cadeau ;
+      // seul le créateur choisit le partenaire, l'autre peut seulement se retirer.
+      allow update: if isMember() && votingOpen()
+        && me() in resource.data.ownerIds
+        && validGift(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy
+        && (me() == resource.data.createdBy
+            || request.resource.data.ownerIds == resource.data.ownerIds
+            || request.resource.data.ownerIds == [resource.data.createdBy]);
+
+      allow delete: if isMember() && votingOpen() && resource.data.createdBy == me();
+
+      function validGift(d) {
+        return d.keys().hasOnly(['ownerIds', 'createdBy', 'title', 'price', 'url', 'imageUrl',
+                                 'description', 'commentary', 'createdAt', 'updatedAt'])
+          && d.ownerIds is list
+          && (d.ownerIds.size() == 1 || (d.ownerIds.size() == 2 && d.ownerIds[0] != d.ownerIds[1]))
+          && d.createdBy in d.ownerIds
+          && d.title is string && d.title.size() > 0 && d.title.size() <= 200
+          && (d.get('price', null) == null || d.price is number)
+          && isText(d.get('url', ''), 2000)
+          && isText(d.get('imageUrl', ''), 2000)
+          && isText(d.get('description', ''), 1000)
+          && isText(d.get('commentary', ''), 1000);
+      }
+    }
+
+    // ------------------------------------------------------------------ Votes
+    // ID du document = {votant}_{destinataire} → un seul vote par personne et par liste.
+    match /votes/{voteId} {
+      // Lecture UNIQUEMENT si je suis dans visibleTo (requête array-contains côté client).
+      allow read: if isMember() && me() in resource.data.visibleTo;
+
+      allow create: if isMember() && votingOpen() && validVote(voteId);
+      allow update: if isMember() && (
+        (votingOpen() && resource.data.voterUserId == me() && validVote(voteId))   // changer d'avis
+        || visibilityRepair()                                                      // maintenance
+      );
+      allow delete: if isMember() && votingOpen() && resource.data.voterUserId == me();
+
+      function validVote(id) {
+        let d = request.resource.data;
+        let gift = get(/databases/$(database)/documents/gifts/$(d.giftId)).data;
+        return d.keys().hasOnly(['giftId', 'voterUserId', 'targetUserId', 'timestamp', 'hiddenFrom', 'visibleTo'])
+          && d.voterUserId == me()
+          && id == me() + '_' + d.targetUserId
+          && d.targetUserId != me()
+          && d.targetUserId in gift.ownerIds          // le cadeau est sur la liste visée
+          && !(me() in gift.ownerIds)                 // on ne vote pas pour son propre cadeau
+          && d.hiddenFrom.toSet() == gift.ownerIds.toSet()
+          && disjoint(d.visibleTo, d.hiddenFrom)      // destinataire(s) exclu(s) de la lecture
+          && me() in d.visibleTo
+          && d.timestamp == request.time;
+      }
+
+      // N'importe quel membre qui voit le vote peut seulement :
+      //  - aligner hiddenFrom sur les propriétaires actuels du cadeau,
+      //  - ajouter des lecteurs (nouveaux inscrits) hors hiddenFrom.
+      function visibilityRepair() {
+        let d = request.resource.data;
+        let gift = get(/databases/$(database)/documents/gifts/$(resource.data.giftId)).data;
+        let hidden = d.hiddenFrom.toSet();
+        return me() in resource.data.visibleTo
+          && d.diff(resource.data).affectedKeys().hasOnly(['hiddenFrom', 'visibleTo'])
+          && hidden == gift.ownerIds.toSet()
+          && d.visibleTo.toSet().intersection(hidden).size() == 0
+          && d.visibleTo.toSet().hasAll(resource.data.visibleTo.toSet().difference(hidden));
+      }
+    }
+
+    // ------------------------------------------- Résultats figés (après 18h00)
+    // selectedGifts/{destinataire} : cadeau(x) retenu(s), égalités incluses.
+    match /selectedGifts/{targetUserId} {
+      allow read: if isMember() && me() in resource.data.visibleTo;
+
+      allow create: if isMember() && votingClosed()
+        && request.resource.data.keys().hasOnly(['targetUserId', 'status', 'giftIds', 'tie', 'maxVotes',
+                                                 'totalVotes', 'hiddenFrom', 'visibleTo', 'computedBy', 'computedAt'])
+        && request.resource.data.targetUserId == targetUserId
+        && request.resource.data.computedBy == me()
+        && me() != targetUserId
+        && targetUserId in request.resource.data.hiddenFrom
+        && !(me() in request.resource.data.hiddenFrom)
+        && me() in request.resource.data.visibleTo
+        && disjoint(request.resource.data.visibleTo, request.resource.data.hiddenFrom)
+        && request.resource.data.giftIds is list
+        && request.resource.data.giftIds.size() <= 5
+        && ownersHidden(request.resource.data.giftIds, request.resource.data.hiddenFrom.toSet());
+
+      // Ajout de lecteurs inscrits plus tard, jamais d'une personne masquée
+      allow update: if isMember() && me() in resource.data.visibleTo
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['visibleTo'])
+        && request.resource.data.visibleTo.toSet().hasAll(resource.data.visibleTo)
+        && disjoint(request.resource.data.visibleTo, resource.data.hiddenFrom);
+
+      allow delete: if false;
+
+      // Les co-propriétaires de chaque cadeau retenu doivent être masqués
+      function ownerOk(ids, i, hidden) {
+        return ids.size() <= i
+          || hidden.hasAll(get(/databases/$(database)/documents/gifts/$(ids[i])).data.ownerIds);
+      }
+      function ownersHidden(ids, hidden) {
+        return ownerOk(ids, 0, hidden) && ownerOk(ids, 1, hidden) && ownerOk(ids, 2, hidden)
+          && ownerOk(ids, 3, hidden) && ownerOk(ids, 4, hidden);
+      }
+    }
+  }
+}
