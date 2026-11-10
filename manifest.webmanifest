@@ -1,0 +1,11 @@
+{
+  "name": "Liste de Noël Familiale",
+  "short_name": "Noël",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f6f0e6",
+  "theme_color": "#14342b",
+  "lang": "fr",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}
