@@ -39,6 +39,9 @@ service cloud.firestore {
       return !exists(familyPath()) || code == get(familyPath()).data.code;
     }
 
+    // Réservation d'un nom (unicité prénom + nom) : names/{clé} → userId
+    function namePath(key) { return /databases/$(database)/documents/names/$(key); }
+
     // Deux listes sans élément commun
     function disjoint(a, b) { return a.toSet().intersection(b.toSet()).size() == 0; }
 
@@ -54,21 +57,53 @@ service cloud.firestore {
       // Première connexion : créé dans le même lot que devices/{mon uid}
       allow create: if signedIn()
         && !exists(devicePath(request.auth.uid))
-        && request.resource.data.keys().hasOnly(['prenom', 'nom', 'deviceTokens', 'familyCode', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['prenom', 'nom', 'nameKey', 'deviceTokens', 'familyCode', 'createdAt'])
         && isName(request.resource.data.prenom)
         && isName(request.resource.data.nom)
         && request.resource.data.deviceTokens == [request.auth.uid]
         && familyCodeOk(request.resource.data.get('familyCode', ''))
-        && getAfter(devicePath(request.auth.uid)).data.userId == userId;
+        && getAfter(devicePath(request.auth.uid)).data.userId == userId
+        // le nom doit être réservé pour ce profil dans le même lot (anti-doublon)
+        && request.resource.data.nameKey is string
+        && getAfter(namePath(request.resource.data.nameKey)).data.userId == userId;
 
       // Le propriétaire modifie son nom et ses appareils
       allow update: if isMember() && me() == userId
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['prenom', 'nom', 'deviceTokens'])
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['prenom', 'nom', 'nameKey', 'deviceTokens'])
         && isName(request.resource.data.prenom)
         && isName(request.resource.data.nom)
-        && request.resource.data.deviceTokens is list;
+        && request.resource.data.deviceTokens is list
+        // nouvelle clé de nom → elle doit être réservée pour moi dans le même lot
+        && (request.resource.data.get('nameKey', '') == resource.data.get('nameKey', '')
+            || getAfter(namePath(request.resource.data.nameKey)).data.userId == userId);
 
       allow delete: if false;
+    }
+
+    // --------------------------------------------- Noms réservés (anti-doublon)
+    // Un seul document par clé « prenom_nom » : une 2e inscription identique est refusée.
+    match /names/{key} {
+      allow get: if signedIn();               // savoir si un nom est pris (avant inscription)
+      allow list: if false;
+
+      allow create: if signedIn()
+        && key.matches('^[a-z0-9_]{1,100}$')
+        && request.resource.data.keys().hasOnly(['userId', 'createdAt'])
+        && getAfter(/databases/$(database)/documents/users/$(request.resource.data.userId)).data.nameKey == key
+        && (
+          // inscription : profil + appareil créés dans le même lot
+          (!exists(devicePath(request.auth.uid))
+            && getAfter(devicePath(request.auth.uid)).data.userId == request.resource.data.userId)
+          ||
+          // renommage ou migration d'un profil existant
+          (isMember() && request.resource.data.userId == me())
+        );
+
+      // Libérer son ancien nom lors d'un renommage
+      allow delete: if isMember()
+        && resource.data.userId == me()
+        && getAfter(/databases/$(database)/documents/users/$(me())).data.nameKey != key;
+      allow update: if false;
     }
 
     // ------------------------------------------------- Appareils (jetons)

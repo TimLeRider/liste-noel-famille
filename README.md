@@ -197,9 +197,14 @@ Fichier : [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) (commen
 | Champ | Type | Description |
 |---|---|---|
 | `prenom`, `nom` | string | Identité affichée |
+| `nameKey` | string | Clé d'unicité du nom (ex. `claudio_di_allano`) |
 | `deviceTokens` | string[] | Jetons (UID anonymes) des appareils associés |
 | `familyCode` | string | Code saisi à l'inscription (vérifié par les règles) |
 | `createdAt` | timestamp | |
+
+### `names/{nameKey}` — noms réservés (anti-doublon)
+
+`userId`, `createdAt`. La clé est le prénom + nom sans accents, en minuscules (`Claudio Di Allano` → `claudio_di_allano`). Le document est créé dans le même lot que le profil : une seconde inscription avec le même nom est refusée par les règles, et l'app propose d'associer l'appareil à la place. Les profils créés avant cette protection réservent leur nom automatiquement à leur prochaine ouverture de l'app.
 
 ### `devices/{deviceToken}` — appareils (table de correspondance jeton → profil)
 
@@ -345,6 +350,13 @@ Les règles ne sont pas publiées (§4.4), le code famille est incorrect, ou les
 
 **Sur iPhone, je dois me ré-associer**
 Safari peut effacer les données d'un site non visité pendant 7 jours. Ajoutez l'app à l'écran d'accueil (Partager → *Sur l'écran d'accueil*). Attention : l'app installée a un stockage **séparé** de Safari, il faut donc l'associer une fois depuis un autre appareil. Associer au moins deux appareils évite toute perte de compte.
+
+**Une personne apparaît deux fois (doublon)**
+Cela arrive quand quelqu'un s'inscrit une 2e fois au lieu d'associer son appareil : inscription sur l'ordinateur, app ajoutée à l'écran d'accueil de l'iPhone après une inscription dans Safari, ou données du navigateur effacées. Depuis l'anti-doublon, c'est bloqué pour les nouvelles inscriptions. Pour supprimer un doublon existant, dans la console Firestore :
+1. Dans `users`, repérez les deux profils (même prénom / nom). Gardez celui qui contient des idées ou des votes, sinon le plus ancien (`createdAt`). Notez l'**ID** du doublon et ses `deviceTokens`.
+2. Supprimez `users/{ID du doublon}`, puis chaque `devices/{jeton}` listé dans ses `deviceTokens`.
+3. Dans `votes`, supprimez les documents dont l'ID commence par `{ID du doublon}_` (sinon ses votes compteraient en double). Dans `names`, supprimez le document dont `userId` est l'ID du doublon, s'il existe.
+4. L'appareil concerné revient à l'écran d'accueil : la personne clique sur « Associer mon téléphone » et valide le code depuis son autre appareil.
 
 **J'ai perdu tous mes appareils**
 Dans la console Firestore, supprimez votre profil et vos documents `devices`, puis recréez un profil. Ou bien un administrateur ajoute un document `devices/{nouveau jeton}` avec votre `userId`.

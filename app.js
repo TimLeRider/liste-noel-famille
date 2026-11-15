@@ -19,7 +19,9 @@ import {
   esc, safeUrl, formatPrice, parsePrice, firstName, fullName, initials, avatarHue,
   formatCountdown, formatDate, toast, openModal, confirmDialog, errorMessage,
 } from './js/ui.js';
-import { startSession, currentUid, registerProfile, updateProfile, removeDevice } from './js/session.js';
+import {
+  startSession, currentUid, registerProfile, updateProfile, removeDevice, ensureNameReserved,
+} from './js/session.js';
 import {
   createPairingRequest, cancelPairing, getPairing, approvePairing, pairingUrl,
   extractCode, drawQr, scannerSupported, startScanner,
@@ -116,6 +118,7 @@ function changed() { scheduleRender(); scheduleMaintenance(); }
 
 let maintenanceTimer = null;
 const finalizeTried = new Set();
+let nameMigrationTried = false;
 function scheduleMaintenance() {
   clearTimeout(maintenanceTimer);
   maintenanceTimer = setTimeout(maintenance, 800);
@@ -133,6 +136,13 @@ function maintenance() {
   if (!state.fromServer.gifts || !state.fromServer.votes) return; // jamais sur un cache partiel
   const gifts = giftMap();
   const userIds = state.users.map((u) => u.id);
+
+  // Profils créés avant l'unicité des noms : réservation automatique du nom
+  const myself = userById(me());
+  if (myself && !myself.nameKey && !nameMigrationTried) {
+    nameMigrationTried = true;
+    ensureNameReserved(myself).catch(() => {});
+  }
 
   data.repairVotes(state.votes, gifts, userIds);
 
@@ -425,6 +435,8 @@ function viewWelcome() {
         <h2>Première visite ?</h2>
         <p class="muted">Créez votre profil sur votre téléphone : il sera reconnu automatiquement
         à chaque visite, sans mot de passe.</p>
+        <p class="small hint">Déjà inscrit sur un autre appareil ? Ne recréez pas de profil :
+          <a href="#/associer">associez plutôt cet appareil</a>.</p>
         <label>Prénom<input name="prenom" required maxlength="40" autocomplete="given-name"></label>
         <label>Nom<input name="nom" required maxlength="40" autocomplete="family-name"></label>
         <label>Code famille <span class="muted small">(si on vous en a donné un)</span>
@@ -885,8 +897,8 @@ function openEditNameModal() {
     e.preventDefault();
     const { prenom, nom } = e.target.elements;
     if (!prenom.value.trim() || !nom.value.trim()) return;
-    try { await updateProfile(me(), { prenom: prenom.value, nom: nom.value }); close(); }
-    catch (err) { toast(errorMessage(err), 'error'); }
+    try { await updateProfile(me(), u.nameKey, { prenom: prenom.value, nom: nom.value }); close(); }
+    catch (err) { toast(err.code === 'duplicate-name' ? err.message : errorMessage(err), 'error'); }
   });
 }
 
@@ -970,8 +982,19 @@ document.addEventListener('submit', async (e) => {
     toast(`Bienvenue ${prenom.value.trim()} ! 🎄`, 'success');
     location.hash = '#/ma-liste';
   } catch (err) {
-    toast(String(err?.code).includes('permission-denied') ? 'Code famille incorrect.' : errorMessage(err), 'error');
     btn.disabled = false;
+    if (err.code === 'duplicate-name') {
+      // Le nom existe déjà : c'est presque toujours la même personne sur un autre appareil
+      const goPair = await confirmDialog(
+        `${err.message} S'il s'agit de vous, n'en créez pas un second : associez plutôt cet appareil `
+        + 'depuis celui où vous êtes déjà inscrit (Profil → Scanner / Valider un nouvel appareil). '
+        + "Si c'est un homonyme, ajoutez une précision au prénom (ex. « Marie (tante) »).",
+        { confirmLabel: '📱 Associer cet appareil', title: 'Profil déjà existant' },
+      );
+      if (goPair) location.hash = '#/associer';
+      return;
+    }
+    toast(String(err?.code).includes('permission-denied') ? 'Code famille incorrect.' : errorMessage(err), 'error');
   }
 });
 

@@ -130,11 +130,11 @@ export function openModal({ title, body, wide = false, onClose }) {
 }
 
 /** Boîte de confirmation ; résout true/false. */
-export function confirmDialog(message, { confirmLabel = 'Confirmer', danger = false } = {}) {
+export function confirmDialog(message, { confirmLabel = 'Confirmer', danger = false, title = 'Confirmation' } = {}) {
   return new Promise((resolve) => {
     let answered = false;
     const { el, close } = openModal({
-      title: 'Confirmation',
+      title,
       body: `<p>${esc(message)}</p>
         <div class="modal-actions">
           <button class="btn btn-ghost" data-close>Annuler</button>

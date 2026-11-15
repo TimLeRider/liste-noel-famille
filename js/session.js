@@ -11,7 +11,7 @@
  */
 import {
   auth, db, signInAnonymously, onAuthStateChanged,
-  doc, collection, onSnapshot, writeBatch, serverTimestamp, arrayRemove, updateDoc,
+  doc, collection, onSnapshot, writeBatch, serverTimestamp, arrayRemove, getDoc,
 } from './firebase.js';
 import { LS_SESSION_KEY } from './config.js';
 import { deviceLabel } from './ui.js';
@@ -62,21 +62,55 @@ export function startSession(onState) {
 export const currentUid = () => auth.currentUser?.uid ?? null;
 
 /**
- * Première connexion : crée le profil + enregistre cet appareil, en une seule écriture atomique.
+ * Clé d'unicité d'un nom : « Claudio Di Allano » et « claudio  di allano » donnent
+ * la même clé « claudio_di_allano » (accents, majuscules et espaces ignorés).
+ * Un document names/{clé} « réserve » le nom : impossible de créer un 2e profil identique.
+ */
+export function nameKey(prenom, nom) {
+  return `${prenom} ${nom}`
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')   // retire les accents
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 100) || 'sans_nom';
+}
+
+/** Erreur dédiée : ce prénom + nom est déjà utilisé par un autre profil. */
+export class DuplicateNameError extends Error {
+  constructor(prenom, nom) {
+    super(`Un profil « ${prenom.trim()} ${nom.trim()} » existe déjà.`);
+    this.code = 'duplicate-name';
+  }
+}
+
+/** Le nom est-il déjà réservé par un autre profil que `exceptUserId` ? */
+async function nameTaken(key, exceptUserId = null) {
+  const snap = await getDoc(doc(db, 'names', key));
+  return snap.exists() && snap.data().userId !== exceptUserId;
+}
+
+/**
+ * Première connexion : crée le profil, réserve le nom et enregistre cet appareil,
+ * en une seule écriture atomique (tout ou rien).
  * familyCode : code famille facultatif, vérifié par les règles si config/family existe.
  */
 export async function registerProfile({ prenom, nom, familyCode }) {
   const uid = currentUid();
   if (!uid) throw new Error('Connexion Firebase pas encore prête, réessayez.');
+  const key = nameKey(prenom, nom);
+  if (await nameTaken(key)) throw new DuplicateNameError(prenom, nom);
+
   const userRef = doc(collection(db, 'users'));
   const batch = writeBatch(db);
   batch.set(userRef, {
     prenom: prenom.trim(),
     nom: nom.trim(),
+    nameKey: key,
     deviceTokens: [uid],
     familyCode: (familyCode || '').trim(),
     createdAt: serverTimestamp(),
   });
+  batch.set(doc(db, 'names', key), { userId: userRef.id, createdAt: serverTimestamp() });
   batch.set(doc(db, 'devices', uid), {
     userId: userRef.id,
     label: deviceLabel(),
@@ -87,9 +121,32 @@ export async function registerProfile({ prenom, nom, familyCode }) {
   return userRef.id;
 }
 
-/** Modifie prénom / nom. */
-export function updateProfile(userId, { prenom, nom }) {
-  return updateDoc(doc(db, 'users', userId), { prenom: prenom.trim(), nom: nom.trim() });
+/** Modifie prénom / nom (et déplace la réservation du nom). */
+export async function updateProfile(userId, oldKey, { prenom, nom }) {
+  const key = nameKey(prenom, nom);
+  if (await nameTaken(key, userId)) throw new DuplicateNameError(prenom, nom);
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'users', userId), { prenom: prenom.trim(), nom: nom.trim(), nameKey: key });
+  if (key !== oldKey) {
+    batch.set(doc(db, 'names', key), { userId, createdAt: serverTimestamp() });
+    if (oldKey) batch.delete(doc(db, 'names', oldKey));
+  }
+  await batch.commit();
+}
+
+/**
+ * Migration des profils créés avant l'unicité des noms : réserve le nom
+ * automatiquement à l'ouverture de l'app. Échoue en silence si le nom est déjà
+ * pris (doublon existant, à supprimer dans la console Firebase).
+ */
+export async function ensureNameReserved(user) {
+  if (user.nameKey) return;
+  const key = nameKey(user.prenom, user.nom);
+  if (await nameTaken(key, user.id)) return;
+  const batch = writeBatch(db);
+  batch.set(doc(db, 'names', key), { userId: user.id, createdAt: serverTimestamp() });
+  batch.update(doc(db, 'users', user.id), { nameKey: key });
+  await batch.commit();
 }
 
 /** Retire un appareil du compte (y compris l'appareil courant = déconnexion). */

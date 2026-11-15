@@ -45,6 +45,16 @@ beforeEach(async () => {
   });
 });
 
+/** Inscription complète (profil + nom réservé + appareil) en un seul lot. */
+function register(uid, userId, key, code = 'SAPIN') {
+  const f = db(uid);
+  const b = writeBatch(f);
+  b.set(doc(f, 'users', userId), { prenom: 'Zoé', nom: 'Test', nameKey: key, deviceTokens: [uid], familyCode: code, createdAt: serverTimestamp() });
+  b.set(doc(f, 'names', key), { userId, createdAt: serverTimestamp() });
+  b.set(doc(f, 'devices', uid), { userId, label: 'Test', method: 'register', createdAt: serverTimestamp() });
+  return b.commit();
+}
+
 const vote = (voter, target, giftId, hiddenFrom, visibleTo) => ({
   giftId, voterUserId: voter, targetUserId: target, timestamp: serverTimestamp(), hiddenFrom, visibleTo,
 });
@@ -57,15 +67,36 @@ test('un inconnu (connecté anonymement, sans profil) ne lit rien', async () => 
 });
 
 test('inscription : refusée avec un mauvais code famille, acceptée avec le bon', async () => {
-  const tryRegister = (code) => {
-    const f = db('newUid');
+  await assertFails(register('newUid', 'newUser', 'zoe_test', 'MAUVAIS'));
+  await assertSucceeds(register('newUid', 'newUser', 'zoe_test', 'SAPIN'));
+});
+
+test('anti-doublon : impossible de créer un 2e profil avec le même prénom + nom', async () => {
+  await assertSucceeds(register('phone', 'zoe1', 'zoe_test'));
+  await assertFails(register('pc', 'zoe2', 'zoe_test'));       // même nom, autre appareil
+  await assertFails((() => {                                    // sans réservation du nom
+    const f = db('pc2');
     const b = writeBatch(f);
-    b.set(doc(f, 'users/newUser'), { prenom: 'Zoé', nom: 'Test', deviceTokens: ['newUid'], familyCode: code, createdAt: serverTimestamp() });
-    b.set(doc(f, 'devices/newUid'), { userId: 'newUser', label: 'Test', method: 'register', createdAt: serverTimestamp() });
+    b.set(doc(f, 'users/zoe3'), { prenom: 'Zoé', nom: 'Test', nameKey: 'zoe_test_bis', deviceTokens: ['pc2'], familyCode: 'SAPIN', createdAt: serverTimestamp() });
+    b.set(doc(f, 'devices/pc2'), { userId: 'zoe3', label: 'Test', method: 'register', createdAt: serverTimestamp() });
     return b.commit();
-  };
-  await assertFails(tryRegister('MAUVAIS'));
-  await assertSucceeds(tryRegister('SAPIN'));
+  })());
+});
+
+test('renommage : la réservation du nom suit le profil', async () => {
+  await register('phone', 'zoe1', 'zoe_test');
+  const f = db('phone');
+  const b = writeBatch(f);
+  b.update(doc(f, 'users/zoe1'), { prenom: 'Zoé', nom: 'Martin', nameKey: 'zoe_martin' });
+  b.set(doc(f, 'names/zoe_martin'), { userId: 'zoe1', createdAt: serverTimestamp() });
+  b.delete(doc(f, 'names/zoe_test'));
+  await assertSucceeds(b.commit());
+  // Alice ne peut pas prendre un nom déjà réservé
+  const fa = db('uA');
+  const b2 = writeBatch(fa);
+  b2.update(doc(fa, 'users/alice'), { nom: 'Martin', prenom: 'Zoé', nameKey: 'zoe_martin' });
+  b2.set(doc(fa, 'names/zoe_martin'), { userId: 'alice', createdAt: serverTimestamp() });
+  await assertFails(b2.commit());
 });
 
 test("impossible de s'approprier un profil existant", async () => {
